@@ -1,0 +1,17 @@
+# Render.com deployment configuration
+# One-click deploy: https://render.com/deploy?repo=https://github.com/YOUR_USERNAME/xolo-latex-editor
+
+services:
+  - type: web
+    name: xolo-latex-compile
+    env: docker
+    region: oregon
+    # Note: This uses Docker which includes LaTeX
+    # For simplest deployment, use the docker file
+    dockerfilePath: Dockerfile
+    dockerCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
