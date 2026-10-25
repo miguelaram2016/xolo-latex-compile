@@ -14,7 +14,10 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { execSync, spawn } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
+const { InvalidProjectError, prepareProjectFiles, writeProjectFiles } = require('./project-files');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
 
@@ -44,10 +47,10 @@ function findPdfLatex() {
   for (const p of possiblePaths) {
     try {
       if (p === 'pdflatex') {
-        execSync('pdflatex --version', { stdio: 'ignore' });
+        execFileSync('pdflatex', ['--version'], { stdio: 'ignore' });
         return 'pdflatex';
       } else if (fs.existsSync(p)) {
-        return process.platform === 'win32' ? `"${p}"` : p;
+        return p;
       }
     } catch (e) {
       // Continue to next
@@ -72,6 +75,7 @@ app.get('/health', (req, res) => {
 app.post('/compile', async (req, res) => {
   const requestId = uuidv4();
   const startTime = Date.now();
+  let tmpDir;
   
   console.log(`[${requestId}] Starting compile...`);
 
@@ -79,12 +83,8 @@ app.post('/compile', async (req, res) => {
   const TIMEOUT_MS = 120000; // 2 minutes
 
   try {
-    const { files = [], projectId, lastModifiedFile } = req.body;
+    const { prepared, main } = prepareProjectFiles(req.body?.files);
     
-    if (!files.length) {
-      return res.status(400).json({ error: 'No files provided' });
-    }
-
     if (!PDFLATEX) {
       return res.status(503).json({ 
         error: 'LaTeX not found',
@@ -93,66 +93,31 @@ app.post('/compile', async (req, res) => {
       });
     }
 
-    // Find main .tex file
-    const mainFile = files.find(f => f.path.endsWith('.tex'));
-    if (!mainFile) {
-      return res.status(400).json({ error: 'No .tex file provided' });
-    }
-
     // Create temp directory
-    const tmpDir = path.join(os.tmpdir(), `latex-${requestId}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'latex-'));
 
-    // Write all files to temp dir
-    for (const file of files) {
-      // Handle escaped newlines from JSON
-      let content = file.content;
-      if (content.includes('\\n')) {
-        content = content.replace(/\\n/g, '\n');
-      }
-      if (content.includes('\\r\\n')) {
-        content = content.replace(/\\r\\n/g, '\n');
-      }
-      
-      const filePath = path.join(tmpDir, file.path);
-      const fileDir = path.dirname(filePath);
-      if (!fs.existsSync(fileDir)) {
-        fs.mkdirSync(fileDir, { recursive: true });
-      }
-      fs.writeFileSync(filePath, content);
-    }
-
-    const texFileName = path.basename(mainFile.path);
-    const texFilePath = path.join(tmpDir, texFileName);
-
-    console.log(`[${requestId}] Compiling ${texFileName} in ${tmpDir}`);
+    writeProjectFiles(tmpDir, prepared);
+    const texFileName = path.basename(main.path);
+    const texFilePath = main.path;
+    console.log(`[${requestId}] Compiling ${texFileName}`);
 
     // Run pdflatex with multiple passes for cross-references
     try {
       // First pass
-      execSync(`${PDFLATEX} -interaction=nonstopmode -halt-on-error "${texFilePath}"`, {
+      await execFileAsync(PDFLATEX, ['-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', '-file-line-error', texFilePath], {
         cwd: tmpDir,
-        stdio: 'pipe',
-        timeout: TIMEOUT_MS
+        maxBuffer: 1024 * 1024,
+        timeout: TIMEOUT_MS,
+        windowsHide: true
       });
 
       // Second pass for cross-references
-      execSync(`${PDFLATEX} -interaction=nonstopmode -halt-on-error "${texFilePath}"`, {
+      await execFileAsync(PDFLATEX, ['-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', '-file-line-error', texFilePath], {
         cwd: tmpDir,
-        stdio: 'pipe',
-        timeout: TIMEOUT_MS
+        maxBuffer: 1024 * 1024,
+        timeout: TIMEOUT_MS,
+        windowsHide: true
       });
-
-      // Try third pass if needed
-      try {
-        execSync(`${PDFLATEX} -interaction=nonstopmode -halt-on-error "${texFilePath}"`, {
-          cwd: tmpDir,
-          stdio: 'pipe',
-          timeout: TIMEOUT_MS
-        });
-      } catch (e) {
-        // Third pass failed, but that's ok - document might not have references
-      }
 
     } catch (compileError) {
       console.error(`[${requestId}] Compile error:`, compileError.message);
@@ -170,7 +135,7 @@ app.post('/compile', async (req, res) => {
         }
       }
       
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      // Cleanup is guaranteed by the outer finally block.
       
       return res.status(500).json({ 
         error: 'LaTeX compilation failed',
@@ -191,7 +156,7 @@ app.post('/compile', async (req, res) => {
       console.log(`[${requestId}] PDF compiled successfully in ${durationMs}ms`);
 
       // Clean up
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      // Cleanup is guaranteed by the outer finally block.
 
       // Return PDF with headers
       res.setHeader('Content-Type', 'application/pdf');
@@ -211,7 +176,7 @@ app.post('/compile', async (req, res) => {
         }
       }
       
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      // Cleanup is guaranteed by the outer finally block.
       
       return res.status(500).json({ 
         error: errorMsg,
@@ -221,12 +186,17 @@ app.post('/compile', async (req, res) => {
     }
 
   } catch (error) {
+    if (error instanceof InvalidProjectError) return res.status(400).json({ error: 'Invalid compile request', details: error.message, requestId });
     console.error(`[${requestId}] Server error:`, error);
     return res.status(500).json({ 
       error: 'Internal server error',
-      details: String(error),
       requestId
     });
+  } finally {
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); }
+      catch (cleanupError) { console.error(`[${requestId}] Cleanup failed:`, cleanupError); }
+    }
   }
 });
 
