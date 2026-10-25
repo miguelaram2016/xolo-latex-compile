@@ -119,17 +119,6 @@ app.post('/compile', async (req, res) => {
         windowsHide: true
       });
 
-      // Try third pass if needed
-      try {
-        execSync(`${PDFLATEX} -interaction=nonstopmode -halt-on-error "${texFilePath}"`, {
-          cwd: tmpDir,
-          stdio: 'pipe',
-          timeout: TIMEOUT_MS
-        });
-      } catch (e) {
-        // Third pass failed, but that's ok - document might not have references
-      }
-
     } catch (compileError) {
       console.error(`[${requestId}] Compile error:`, compileError.message);
       
@@ -201,7 +190,6 @@ app.post('/compile', async (req, res) => {
     console.error(`[${requestId}] Server error:`, error);
     return res.status(500).json({ 
       error: 'Internal server error',
-      details: String(error),
       requestId
     });
   } finally {
